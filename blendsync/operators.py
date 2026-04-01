@@ -6,6 +6,36 @@ import bpy
 from . import git_interface, serializer
 
 
+# ── Branch color palette ───────────────────────────────────────────────────
+# Maps slot index → Blender COLORSET icon name.
+# Slot 0 is always reserved for main/master (green).
+
+BRANCH_COLORS = [
+    'COLORSET_04_VEC',  # green  — main/master
+    'COLORSET_01_VEC',  # red
+    'COLORSET_06_VEC',  # blue
+    'COLORSET_03_VEC',  # yellow
+    'COLORSET_07_VEC',  # purple
+    'COLORSET_02_VEC',  # orange
+    'COLORSET_05_VEC',  # teal
+    'COLORSET_08_VEC',  # violet
+    'COLORSET_11_VEC',  # light green
+    'COLORSET_09_VEC',  # dark blue
+]
+
+
+def _color_for_branch(name, all_names):
+    """Stable assignment: main/master always green, others sorted alphabetically."""
+    if name in ('main', 'master'):
+        return BRANCH_COLORS[0]
+    others = sorted(n for n in all_names if n not in ('main', 'master'))
+    try:
+        idx = (others.index(name) + 1) % len(BRANCH_COLORS)
+    except ValueError:
+        idx = 1
+    return BRANCH_COLORS[idx]
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def _get_repo_path():
@@ -72,17 +102,60 @@ def _format_change(c):
     return 'DOT', str(c)
 
 
+def _populate_diff(scene, blend_path, repo_path):
+    """Compute diff between the two most recent commits and store results."""
+    from . import differ
+
+    json_path = blend_path.replace('.blend', '.blendsync.json')
+    entries = git_interface.get_log(repo_path, count=2)
+    scene.blendsync_diff_results.clear()
+
+    if len(entries) < 2:
+        scene.blendsync_diff_summary = "Initial commit — nothing to compare yet."
+        return
+
+    hash_new = entries[0]['hash']
+    hash_old = entries[1]['hash']
+
+    try:
+        snap_old = git_interface.get_snapshot_at_commit(repo_path, hash_old, json_path)
+        snap_new = git_interface.get_snapshot_at_commit(repo_path, hash_new, json_path)
+    except (git_interface.GitError, json.JSONDecodeError, ValueError) as e:
+        scene.blendsync_diff_summary = f"Could not load snapshots: {e}"
+        return
+
+    changes = differ.diff(snap_old, snap_new)
+    n = len(changes)
+    scene.blendsync_diff_summary = (
+        f"{hash_old} → {hash_new}   ({n} change{'s' if n != 1 else ''})"
+    )
+
+    if not changes:
+        item = scene.blendsync_diff_results.add()
+        item.text = "No differences — scene unchanged from previous commit."
+        item.icon_name = 'CHECKMARK'
+    else:
+        for change in changes:
+            icon, text = _format_change(change)
+            item = scene.blendsync_diff_results.add()
+            item.text = text
+            item.icon_name = icon
+
+
 # ── Property Groups ────────────────────────────────────────────────────────
 
 class BlendSyncCommitItem(bpy.types.PropertyGroup):
     hash: bpy.props.StringProperty()
     message: bpy.props.StringProperty()
     date: bpy.props.StringProperty()
+    branch_label: bpy.props.StringProperty()   # branch name if this is a tip
+    color_tag: bpy.props.StringProperty()       # COLORSET_XX_VEC icon
 
 
 class BlendSyncBranchItem(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty()
     is_current: bpy.props.BoolProperty()
+    color_tag: bpy.props.StringProperty()       # COLORSET_XX_VEC icon
 
 
 class BlendSyncDiffLineItem(bpy.types.PropertyGroup):
@@ -95,7 +168,7 @@ class BlendSyncDiffLineItem(bpy.types.PropertyGroup):
 class BLENDSYNC_OT_init_repo(bpy.types.Operator):
     bl_idname = "blendsync.init_repo"
     bl_label = "Initialize Repository"
-    bl_description = "Create a git repository in the same folder as your .blend file"
+    bl_description = "Create a git repository with a main branch in the same folder as your .blend file"
 
     def execute(self, context):
         blend_path, repo_path = _get_repo_path()
@@ -105,6 +178,7 @@ class BLENDSYNC_OT_init_repo(bpy.types.Operator):
         try:
             git_interface.init_repo(repo_path)
             bpy.ops.blendsync.refresh_branches()
+            bpy.ops.blendsync.refresh_log()
             self.report({'INFO'}, f"Repository initialized at: {repo_path}")
         except git_interface.GitError as e:
             self.report({'ERROR'}, f"Git error: {e}")
@@ -134,6 +208,10 @@ class BLENDSYNC_OT_commit(bpy.types.Operator):
             self.report({'ERROR'}, "No repository found. Click 'Initialize Repository' first.")
             return {'CANCELLED'}
 
+        # Save the .blend first so git captures the current scene state,
+        # not just whatever was on disk from the last manual Ctrl+S.
+        bpy.ops.wm.save_mainfile()
+
         try:
             data = serializer.serialize_scene()
             json_path = blend_path.replace('.blend', '.blendsync.json')
@@ -150,7 +228,9 @@ class BLENDSYNC_OT_commit(bpy.types.Operator):
             return {'CANCELLED'}
 
         context.scene.blendsync_commit_message = ""
+        bpy.ops.blendsync.refresh_branches()
         bpy.ops.blendsync.refresh_log()
+        _populate_diff(context.scene, blend_path, repo_path)
         self.report({'INFO'}, f"Committed: {message}")
         return {'FINISHED'}
 
@@ -167,91 +247,25 @@ class BLENDSYNC_OT_refresh_log(bpy.types.Operator):
         if not blend_path or not git_interface.is_repo(repo_path):
             return {'CANCELLED'}
 
-        entries = git_interface.get_log(repo_path)
+        # Build color lookup from already-populated branch list
         scene = context.scene
+        branch_colors = {b.name: b.color_tag for b in scene.blendsync_branches}
+
+        entries = git_interface.get_log(repo_path)
         scene.blendsync_history.clear()
+
         for e in entries:
             item = scene.blendsync_history.add()
             item.hash = e['hash']
             item.message = e['message']
             item.date = e['date']
-        return {'FINISHED'}
+            # Annotate with color if this commit is the tip of a known branch
+            for ref in e.get('refs', []):
+                if ref in branch_colors:
+                    item.branch_label = ref
+                    item.color_tag = branch_colors[ref]
+                    break
 
-
-class BLENDSYNC_OT_set_diff_a(bpy.types.Operator):
-    bl_idname = "blendsync.set_diff_a"
-    bl_label = "Set as Diff A"
-    bl_description = "Use this commit as the 'before' snapshot for comparison"
-
-    commit_hash: bpy.props.StringProperty()
-
-    def execute(self, context):
-        context.scene.blendsync_diff_hash_a = self.commit_hash
-        return {'FINISHED'}
-
-
-class BLENDSYNC_OT_set_diff_b(bpy.types.Operator):
-    bl_idname = "blendsync.set_diff_b"
-    bl_label = "Set as Diff B"
-    bl_description = "Use this commit as the 'after' snapshot for comparison"
-
-    commit_hash: bpy.props.StringProperty()
-
-    def execute(self, context):
-        context.scene.blendsync_diff_hash_b = self.commit_hash
-        return {'FINISHED'}
-
-
-class BLENDSYNC_OT_run_diff(bpy.types.Operator):
-    bl_idname = "blendsync.run_diff"
-    bl_label = "Compare A → B"
-    bl_description = "Show all changes between the two selected commits"
-
-    def execute(self, context):
-        from . import differ
-
-        scene = context.scene
-        hash_a = scene.blendsync_diff_hash_a
-        hash_b = scene.blendsync_diff_hash_b
-
-        if not hash_a or not hash_b:
-            self.report({'ERROR'}, "Mark both an A and a B commit first.")
-            return {'CANCELLED'}
-        if hash_a == hash_b:
-            self.report({'ERROR'}, "A and B are the same commit.")
-            return {'CANCELLED'}
-
-        blend_path, repo_path = _get_repo_path()
-        json_filename = os.path.basename(blend_path).replace('.blend', '.blendsync.json')
-
-        try:
-            snap_a = git_interface.get_snapshot_at_commit(repo_path, hash_a, json_filename)
-            snap_b = git_interface.get_snapshot_at_commit(repo_path, hash_b, json_filename)
-        except (git_interface.GitError, json.JSONDecodeError, ValueError) as e:
-            self.report({'ERROR'}, f"Could not load snapshots: {e}")
-            return {'CANCELLED'}
-
-        changes = differ.diff(snap_a, snap_b)
-
-        scene.blendsync_diff_results.clear()
-        n = len(changes)
-        scene.blendsync_diff_summary = (
-            f"{hash_a} → {hash_b}   "
-            f"({n} change{'s' if n != 1 else ''})"
-        )
-
-        if not changes:
-            item = scene.blendsync_diff_results.add()
-            item.text = "No differences found."
-            item.icon_name = 'CHECKMARK'
-        else:
-            for change in changes:
-                icon, text = _format_change(change)
-                item = scene.blendsync_diff_results.add()
-                item.text = text
-                item.icon_name = icon
-
-        self.report({'INFO'}, f"Diff complete: {n} change{'s' if n != 1 else ''}")
         return {'FINISHED'}
 
 
@@ -260,7 +274,7 @@ class BLENDSYNC_OT_revert_commit(bpy.types.Operator):
     bl_label = "Revert to this Commit"
     bl_description = (
         "Restore the .blend and JSON to this commit's state. "
-        "Your current work will be overwritten."
+        "Your current uncommitted work will be overwritten."
     )
 
     commit_hash: bpy.props.StringProperty()
@@ -280,12 +294,18 @@ class BLENDSYNC_OT_revert_commit(bpy.types.Operator):
             self.report({'ERROR'}, f"Git error: {e}")
             return {'CANCELLED'}
 
-        # Reload the .blend from disk using a timer so the operator can finish first
+        context.scene.blendsync_diff_results.clear()
+        context.scene.blendsync_diff_summary = ""
+
+        _blend_path = blend_path  # capture for closure
+
         def _reload():
-            bpy.ops.wm.revert_mainfile()
+            # load_ui=False keeps the current workspace/tab instead of
+            # restoring whatever tab was active when this commit was saved.
+            bpy.ops.wm.open_mainfile(filepath=_blend_path, load_ui=False)
             return None
 
-        bpy.app.timers.register(_reload, first_interval=0.05)
+        bpy.app.timers.register(_reload, first_interval=0.1)
         self.report({'INFO'}, f"Reverted to {self.commit_hash}")
         return {'FINISHED'}
 
@@ -302,20 +322,24 @@ class BLENDSYNC_OT_refresh_branches(bpy.types.Operator):
         if not blend_path or not git_interface.is_repo(repo_path):
             return {'CANCELLED'}
 
-        current, branches = git_interface.get_branches(repo_path)
+        _, branches = git_interface.get_branches(repo_path)
+        all_names = [b['name'] for b in branches]
+
         scene = context.scene
         scene.blendsync_branches.clear()
         for b in branches:
             item = scene.blendsync_branches.add()
             item.name = b['name']
             item.is_current = b['is_current']
+            item.color_tag = _color_for_branch(b['name'], all_names)
+
         return {'FINISHED'}
 
 
 class BLENDSYNC_OT_create_branch(bpy.types.Operator):
     bl_idname = "blendsync.create_branch"
     bl_label = "Create Branch"
-    bl_description = "Create a new branch and switch to it"
+    bl_description = "Create a new branch from the current commit and switch to it"
 
     def execute(self, context):
         blend_path, repo_path = _get_repo_path()
@@ -367,14 +391,18 @@ class BLENDSYNC_OT_checkout_branch(bpy.types.Operator):
             self.report({'ERROR'}, f"Git error: {e}")
             return {'CANCELLED'}
 
+        context.scene.blendsync_diff_results.clear()
+        context.scene.blendsync_diff_summary = ""
         bpy.ops.blendsync.refresh_branches()
         bpy.ops.blendsync.refresh_log()
 
+        _blend_path = blend_path  # capture for closure
+
         def _reload():
-            bpy.ops.wm.revert_mainfile()
+            bpy.ops.wm.open_mainfile(filepath=_blend_path, load_ui=False)
             return None
 
-        bpy.app.timers.register(_reload, first_interval=0.05)
+        bpy.app.timers.register(_reload, first_interval=0.1)
         self.report({'INFO'}, f"Switched to branch: {self.branch_name}")
         return {'FINISHED'}
 
@@ -388,9 +416,6 @@ classes = [
     BLENDSYNC_OT_init_repo,
     BLENDSYNC_OT_commit,
     BLENDSYNC_OT_refresh_log,
-    BLENDSYNC_OT_set_diff_a,
-    BLENDSYNC_OT_set_diff_b,
-    BLENDSYNC_OT_run_diff,
     BLENDSYNC_OT_revert_commit,
     BLENDSYNC_OT_refresh_branches,
     BLENDSYNC_OT_create_branch,

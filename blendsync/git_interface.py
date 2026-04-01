@@ -32,17 +32,33 @@ def run_git(args, cwd):
 
 
 def init_repo(path):
-    run_git(['init'], cwd=path)
-    # Set a default identity so commits work without global git config
+    # Try git >= 2.28 (-b flag); fall back to symbolic-ref for older git
+    try:
+        run_git(['init', '-b', 'main'], cwd=path)
+    except GitError:
+        run_git(['init'], cwd=path)
+        try:
+            run_git(['symbolic-ref', 'HEAD', 'refs/heads/main'], cwd=path)
+        except GitError:
+            pass
+
     try:
         run_git(['config', 'user.email', 'blendsync@local'], cwd=path)
         run_git(['config', 'user.name', 'BlendSync'], cwd=path)
     except GitError:
         pass
+
     gitignore = os.path.join(path, '.gitignore')
     if not os.path.exists(gitignore):
         with open(gitignore, 'w') as f:
             f.write('*.blend1\n*.blend2\n')
+
+    # Initial commit so 'main' branch actually exists
+    run_git(['add', '.'], cwd=path)
+    try:
+        run_git(['commit', '-m', 'Initialize BlendSync repository'], cwd=path)
+    except GitError:
+        pass  # Nothing to commit is fine
 
 
 def commit(repo_path, message):
@@ -60,12 +76,28 @@ def has_changes(repo_path):
 
 # ── Log ────────────────────────────────────────────────────────────────────
 
+def _parse_refs(refs_str):
+    """Parse git %D decoration into a list of local branch names."""
+    if not refs_str.strip():
+        return []
+    branches = []
+    for ref in refs_str.split(','):
+        ref = ref.strip()
+        if ref.startswith('HEAD -> '):
+            branches.append(ref[8:])
+        elif ref.startswith('HEAD') or '/' in ref or ref.startswith('tag:'):
+            pass  # skip detached HEAD, remote refs, tags
+        else:
+            branches.append(ref)
+    return branches
+
+
 def get_log(repo_path, count=50):
-    """Return a list of dicts: hash, message, date."""
+    """Return list of dicts: hash, message, date, refs (local branch names)."""
     try:
         output = run_git(
             ['log', f'--max-count={count}',
-             '--pretty=format:%h|||%s|||%ad', '--date=short'],
+             '--pretty=format:%h|||%s|||%ad|||%D', '--date=short'],
             cwd=repo_path,
         )
         if not output:
@@ -79,15 +111,21 @@ def get_log(repo_path, count=50):
                 'hash': parts[0].strip(),
                 'message': parts[1].strip() if len(parts) > 1 else '',
                 'date': parts[2].strip() if len(parts) > 2 else '',
+                'refs': _parse_refs(parts[3]) if len(parts) > 3 else [],
             })
         return entries
     except GitError:
         return []
 
 
-def get_snapshot_at_commit(repo_path, commit_hash, json_filename):
-    """Return the parsed JSON snapshot stored at a specific commit."""
-    output = run_git(['show', f'{commit_hash}:{json_filename}'], cwd=repo_path)
+def get_snapshot_at_commit(repo_path, commit_ref, json_path):
+    """Load the JSON snapshot stored at a given commit.
+    json_path may be absolute or relative to repo_path."""
+    if os.path.isabs(json_path):
+        json_path = os.path.relpath(json_path, repo_path)
+    # Normalize to forward slashes (git show requires this even on Windows)
+    json_path = json_path.replace('\\', '/')
+    output = run_git(['show', f'{commit_ref}:{json_path}'], cwd=repo_path)
     return json.loads(output)
 
 
@@ -124,17 +162,15 @@ def get_current_branch(repo_path):
 
 
 def create_branch(repo_path, name):
-    """Create and immediately switch to a new branch."""
     run_git(['checkout', '-b', name], cwd=repo_path)
 
 
 def checkout_branch(repo_path, name):
-    """Switch to an existing branch."""
     run_git(['checkout', name], cwd=repo_path)
 
 
 # ── Revert ─────────────────────────────────────────────────────────────────
 
 def revert_to_commit(repo_path, commit_hash):
-    """Restore the working tree to the state at commit_hash without moving HEAD."""
+    """Restore working tree to the state at commit_hash without moving HEAD."""
     run_git(['checkout', commit_hash, '--', '.'], cwd=repo_path)

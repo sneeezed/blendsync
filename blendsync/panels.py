@@ -5,8 +5,6 @@ import bpy
 from . import git_interface
 
 
-# ── Shared guard ───────────────────────────────────────────────────────────
-
 def _repo_ready(context):
     blend_path = bpy.data.filepath
     if not blend_path:
@@ -19,37 +17,35 @@ def _repo_ready(context):
 
 class BLENDSYNC_UL_history(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
-        scene = context.scene
         row = layout.row(align=True)
 
-        # Date + hash + message
-        row.label(text=f"{item.date}  {item.hash}", icon='RECOVER_LAST')
+        # Color dot: branch tip gets its branch color, other commits get a dim dot
+        dot_icon = item.color_tag if item.color_tag else 'DOT'
+        row.label(text="", icon=dot_icon)
+
+        row.label(text=f"{item.date}  {item.hash}")
+
+        # Show branch label badge when this commit is the tip of a branch
+        if item.branch_label:
+            sub = row.row()
+            sub.scale_x = 0.7
+            sub.label(text=item.branch_label)
+
         row.label(text=item.message)
 
-        # Highlight if selected as A or B
-        is_a = item.hash == scene.blendsync_diff_hash_a
-        is_b = item.hash == scene.blendsync_diff_hash_b
-
-        sub = row.row(align=True)
-        sub.scale_x = 0.6
-
-        op_a = sub.operator("blendsync.set_diff_a", text="A",
-                            depress=is_a, emboss=True)
-        op_a.commit_hash = item.hash
-
-        op_b = sub.operator("blendsync.set_diff_b", text="B",
-                            depress=is_b, emboss=True)
-        op_b.commit_hash = item.hash
-
-        op_r = sub.operator("blendsync.revert_commit", text="", icon='LOOP_BACK')
-        op_r.commit_hash = item.hash
+        op = row.operator("blendsync.revert_commit", text="", icon='LOOP_BACK')
+        op.commit_hash = item.hash
 
 
 class BLENDSYNC_UL_branches(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
         row = layout.row(align=True)
-        icon = 'LAYER_ACTIVE' if item.is_current else 'LAYER_USED'
-        row.label(text=item.name, icon=icon)
+        dot_icon = item.color_tag if item.color_tag else 'DOT'
+        row.label(text="", icon=dot_icon)
+
+        name_icon = 'LAYER_ACTIVE' if item.is_current else 'NONE'
+        row.label(text=item.name, icon=name_icon)
+
         if item.is_current:
             row.label(text="current")
         else:
@@ -57,7 +53,7 @@ class BLENDSYNC_UL_branches(bpy.types.UIList):
             op.branch_name = item.name
 
 
-# ── Main panel (status bar) ────────────────────────────────────────────────
+# ── Main panel ─────────────────────────────────────────────────────────────
 
 class BLENDSYNC_PT_main(bpy.types.Panel):
     bl_label = "BlendSync"
@@ -86,8 +82,17 @@ class BLENDSYNC_PT_main(bpy.types.Panel):
         col.label(text=os.path.basename(blend_path), icon='FILE_BLEND')
 
         if repo_exists:
+            scene = context.scene
             branch = git_interface.get_current_branch(repo_path)
-            col.label(text=f"Branch: {branch or '(unknown)'}", icon='BOOKMARKS')
+            # Find the color for the current branch
+            color_icon = 'LAYER_ACTIVE'
+            for b in scene.blendsync_branches:
+                if b.name == branch:
+                    color_icon = b.color_tag or 'LAYER_ACTIVE'
+                    break
+            row = col.row(align=True)
+            row.label(text="", icon=color_icon)
+            row.label(text=branch or "(unknown branch)")
         else:
             col.label(text="No repository yet.", icon='INFO')
             col.operator("blendsync.init_repo", icon='ADD')
@@ -109,7 +114,6 @@ class BLENDSYNC_PT_commit(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
-
         col = layout.column(align=True)
         col.prop(scene, "blendsync_commit_message", text="", placeholder="Describe this snapshot…")
         col.operator("blendsync.commit", icon='FILE_TICK')
@@ -142,10 +146,10 @@ class BLENDSYNC_PT_branches(bpy.types.Panel):
                 "BLENDSYNC_UL_branches", "",
                 scene, "blendsync_branches",
                 scene, "blendsync_branches_index",
-                rows=3,
+                rows=min(len(scene.blendsync_branches), 5),
             )
         else:
-            layout.label(text="No branches yet (commit first).", icon='INFO')
+            layout.label(text="No branches yet.", icon='INFO')
 
         layout.separator()
         col = layout.column(align=True)
@@ -182,37 +186,23 @@ class BLENDSYNC_PT_history(bpy.types.Panel):
                 scene, "blendsync_history_index",
                 rows=6,
             )
-
-            # Diff controls
-            layout.separator()
-            box = layout.box()
-            box.label(text="Compare two commits", icon='ARROW_LEFTRIGHT')
-
-            col = box.column(align=True)
-            a = scene.blendsync_diff_hash_a
-            b = scene.blendsync_diff_hash_b
-            col.label(text=f"A:  {a if a else '— not set —'}", icon='TRIA_RIGHT')
-            col.label(text=f"B:  {b if b else '— not set —'}", icon='TRIA_RIGHT')
-
-            row = box.row()
-            row.enabled = bool(a and b and a != b)
-            row.operator("blendsync.run_diff", icon='VIEWZOOM')
         else:
             layout.label(text="No commits yet.")
 
 
-# ── Diff results sub-panel ─────────────────────────────────────────────────
+# ── Last commit diff sub-panel ─────────────────────────────────────────────
 
-class BLENDSYNC_PT_diff_results(bpy.types.Panel):
-    bl_label = "Diff Results"
-    bl_idname = "BLENDSYNC_PT_diff_results"
+class BLENDSYNC_PT_last_commit(bpy.types.Panel):
+    bl_label = "Last Commit Changes"
+    bl_idname = "BLENDSYNC_PT_last_commit"
     bl_parent_id = "BLENDSYNC_PT_main"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
+    bl_options = {'DEFAULT_CLOSED'}
 
     @classmethod
     def poll(cls, context):
-        return _repo_ready(context) and bool(context.scene.blendsync_diff_results)
+        return _repo_ready(context) and bool(context.scene.blendsync_diff_summary)
 
     def draw(self, context):
         layout = self.layout
@@ -238,5 +228,5 @@ classes = [
     BLENDSYNC_PT_commit,
     BLENDSYNC_PT_branches,
     BLENDSYNC_PT_history,
-    BLENDSYNC_PT_diff_results,
+    BLENDSYNC_PT_last_commit,
 ]

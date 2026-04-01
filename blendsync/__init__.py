@@ -1,7 +1,7 @@
 bl_info = {
     "name": "BlendSync",
     "author": "BlendSync",
-    "version": (0, 2, 0),
+    "version": (0, 3, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > BlendSync",
     "description": "Git-style version control and async collaboration for Blender",
@@ -39,8 +39,6 @@ def register():
         name="New Branch Name", default="",
     )
 
-    bpy.types.Scene.blendsync_diff_hash_a = bpy.props.StringProperty(default="")
-    bpy.types.Scene.blendsync_diff_hash_b = bpy.props.StringProperty(default="")
     bpy.types.Scene.blendsync_diff_summary = bpy.props.StringProperty(default="")
     bpy.types.Scene.blendsync_diff_results = bpy.props.CollectionProperty(
         type=operators.BlendSyncDiffLineItem,
@@ -63,7 +61,6 @@ def unregister():
         'blendsync_history', 'blendsync_history_index',
         'blendsync_branches', 'blendsync_branches_index',
         'blendsync_new_branch_name',
-        'blendsync_diff_hash_a', 'blendsync_diff_hash_b',
         'blendsync_diff_summary', 'blendsync_diff_results',
     ):
         if hasattr(bpy.types.Scene, prop):
