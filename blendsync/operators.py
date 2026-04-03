@@ -7,8 +7,6 @@ from . import git_interface, serializer
 
 
 # ── Branch color palette ───────────────────────────────────────────────────
-# Maps slot index → Blender COLORSET icon name.
-# Slot 0 is always reserved for main/master (green).
 
 BRANCH_COLORS = [
     'COLORSET_04_VEC',  # green  — main/master
@@ -25,7 +23,6 @@ BRANCH_COLORS = [
 
 
 def _color_for_branch(name, all_names):
-    """Stable assignment: main/master always green, others sorted alphabetically."""
     if name in ('main', 'master'):
         return BRANCH_COLORS[0]
     others = sorted(n for n in all_names if n not in ('main', 'master'))
@@ -70,7 +67,7 @@ def _format_change(c):
     if t == 'object_visibility_changed':
         return 'HIDE_OFF', f"{name}: visibility → {c.get('to')}"
     if t == 'geometry_changed':
-        return 'MESH_DATA', f"{name}: geometry changed  ({c.get('detail', '')})"
+        return 'MESH_DATA', f"{name}: mesh edited  ({c.get('detail', '')})"
     if t == 'modifier_added':
         return 'MODIFIER', f"{name}: modifier '{c.get('modifier', '')}' added"
     if t == 'modifier_removed':
@@ -79,6 +76,13 @@ def _format_change(c):
         return 'MODIFIER', (
             f"{name} / '{c.get('modifier', '')}': "
             f"{c.get('property')} → {c.get('to')}"
+        )
+    if t == 'geo_nodes_edited':
+        return 'GEOMETRY_NODES', f"{name}: Geometry Nodes '{c.get('modifier', '')}' edited"
+    if t == 'geo_nodes_reassigned':
+        return 'GEOMETRY_NODES', (
+            f"{name}: Geometry Nodes '{c.get('modifier', '')}' "
+            f"reassigned  {c.get('from')} → {c.get('to')}"
         )
     if t == 'material_added':
         return 'MATERIAL', f"Material added: {name}"
@@ -93,53 +97,23 @@ def _format_change(c):
     if t == 'node_changed':
         return 'NODETREE', (
             f"{c.get('material', '')} / {c.get('node', '')}: "
-            f"'{c.get('input', '')}' changed"
+            f"'{c.get('input', '')}' value changed"
         )
+    if t == 'shader_node_added':
+        return 'NODETREE', f"{c.get('material', '')}: shader node '{c.get('node', '')}' added"
+    if t == 'shader_node_removed':
+        return 'NODETREE', f"{c.get('material', '')}: shader node '{c.get('node', '')}' removed"
+    if t == 'shader_links_changed':
+        return 'NODETREE', f"{c.get('material', '')}: shader connections changed"
+    if t == 'shader_nodes_enabled':
+        return 'NODETREE', f"{c.get('material', '')}: shader nodes enabled"
+    if t == 'shader_nodes_disabled':
+        return 'NODETREE', f"{c.get('material', '')}: shader nodes disabled"
     if t == 'render_changed':
         return 'RENDER_RESULT', (
             f"Render {c.get('property', '')}: {c.get('from')} → {c.get('to')}"
         )
     return 'DOT', str(c)
-
-
-def _populate_diff(scene, blend_path, repo_path):
-    """Compute diff between the two most recent commits and store results."""
-    from . import differ
-
-    json_path = blend_path.replace('.blend', '.blendsync.json')
-    entries = git_interface.get_log(repo_path, count=2)
-    scene.blendsync_diff_results.clear()
-
-    if len(entries) < 2:
-        scene.blendsync_diff_summary = "Initial commit — nothing to compare yet."
-        return
-
-    hash_new = entries[0]['hash']
-    hash_old = entries[1]['hash']
-
-    try:
-        snap_old = git_interface.get_snapshot_at_commit(repo_path, hash_old, json_path)
-        snap_new = git_interface.get_snapshot_at_commit(repo_path, hash_new, json_path)
-    except (git_interface.GitError, json.JSONDecodeError, ValueError) as e:
-        scene.blendsync_diff_summary = f"Could not load snapshots: {e}"
-        return
-
-    changes = differ.diff(snap_old, snap_new)
-    n = len(changes)
-    scene.blendsync_diff_summary = (
-        f"{hash_old} → {hash_new}   ({n} change{'s' if n != 1 else ''})"
-    )
-
-    if not changes:
-        item = scene.blendsync_diff_results.add()
-        item.text = "No differences — scene unchanged from previous commit."
-        item.icon_name = 'CHECKMARK'
-    else:
-        for change in changes:
-            icon, text = _format_change(change)
-            item = scene.blendsync_diff_results.add()
-            item.text = text
-            item.icon_name = icon
 
 
 # ── Property Groups ────────────────────────────────────────────────────────
@@ -148,14 +122,15 @@ class BlendSyncCommitItem(bpy.types.PropertyGroup):
     hash: bpy.props.StringProperty()
     message: bpy.props.StringProperty()
     date: bpy.props.StringProperty()
-    branch_label: bpy.props.StringProperty()   # branch name if this is a tip
-    color_tag: bpy.props.StringProperty()       # COLORSET_XX_VEC icon
+    branch_label: bpy.props.StringProperty()
+    color_tag: bpy.props.StringProperty()
+    is_head: bpy.props.BoolProperty()
 
 
 class BlendSyncBranchItem(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty()
     is_current: bpy.props.BoolProperty()
-    color_tag: bpy.props.StringProperty()       # COLORSET_XX_VEC icon
+    color_tag: bpy.props.StringProperty()
 
 
 class BlendSyncDiffLineItem(bpy.types.PropertyGroup):
@@ -208,8 +183,6 @@ class BLENDSYNC_OT_commit(bpy.types.Operator):
             self.report({'ERROR'}, "No repository found. Click 'Initialize Repository' first.")
             return {'CANCELLED'}
 
-        # Save the .blend first so git captures the current scene state,
-        # not just whatever was on disk from the last manual Ctrl+S.
         bpy.ops.wm.save_mainfile()
 
         try:
@@ -227,10 +200,13 @@ class BLENDSYNC_OT_commit(bpy.types.Operator):
             self.report({'ERROR'}, f"Git error: {e}")
             return {'CANCELLED'}
 
+        # Committing always brings us back to real HEAD — clear any revert marker
+        git_interface.clear_head_marker(repo_path)
+
         context.scene.blendsync_commit_message = ""
         bpy.ops.blendsync.refresh_branches()
         bpy.ops.blendsync.refresh_log()
-        _populate_diff(context.scene, blend_path, repo_path)
+        bpy.ops.blendsync.refresh_staged()
         self.report({'INFO'}, f"Committed: {message}")
         return {'FINISHED'}
 
@@ -247,11 +223,11 @@ class BLENDSYNC_OT_refresh_log(bpy.types.Operator):
         if not blend_path or not git_interface.is_repo(repo_path):
             return {'CANCELLED'}
 
-        # Build color lookup from already-populated branch list
-        scene = context.scene
-        branch_colors = {b.name: b.color_tag for b in scene.blendsync_branches}
+        branch_colors = {b.name: b.color_tag for b in context.scene.blendsync_branches}
+        current_hash = git_interface.get_effective_commit(repo_path)
 
         entries = git_interface.get_log(repo_path)
+        scene = context.scene
         scene.blendsync_history.clear()
 
         for e in entries:
@@ -259,7 +235,7 @@ class BLENDSYNC_OT_refresh_log(bpy.types.Operator):
             item.hash = e['hash']
             item.message = e['message']
             item.date = e['date']
-            # Annotate with color if this commit is the tip of a known branch
+            item.is_head = (e['hash'] == current_hash)
             for ref in e.get('refs', []):
                 if ref in branch_colors:
                     item.branch_label = ref
@@ -294,19 +270,71 @@ class BLENDSYNC_OT_revert_commit(bpy.types.Operator):
             self.report({'ERROR'}, f"Git error: {e}")
             return {'CANCELLED'}
 
-        context.scene.blendsync_diff_results.clear()
-        context.scene.blendsync_diff_summary = ""
+        # Write marker so the ▶ indicator survives the file reload
+        git_interface.write_head_marker(repo_path, self.commit_hash)
 
-        _blend_path = blend_path  # capture for closure
+        _blend_path = blend_path
 
         def _reload():
-            # load_ui=False keeps the current workspace/tab instead of
-            # restoring whatever tab was active when this commit was saved.
             bpy.ops.wm.open_mainfile(filepath=_blend_path, load_ui=False)
             return None
 
         bpy.app.timers.register(_reload, first_interval=0.1)
         self.report({'INFO'}, f"Reverted to {self.commit_hash}")
+        return {'FINISHED'}
+
+
+# ── Staged changes (live diff) ─────────────────────────────────────────────
+
+class BLENDSYNC_OT_refresh_staged(bpy.types.Operator):
+    bl_idname = "blendsync.refresh_staged"
+    bl_label = "Refresh Changes"
+    bl_description = "Compare the current scene against the last commit"
+
+    def execute(self, context):
+        from . import differ
+
+        blend_path, repo_path = _get_repo_path()
+        scene = context.scene
+        scene.blendsync_staged_changes.clear()
+        scene.blendsync_staged_summary = ""
+
+        if not blend_path or not git_interface.is_repo(repo_path):
+            return {'CANCELLED'}
+
+        json_path = blend_path.replace('.blend', '.blendsync.json')
+        current_ref = git_interface.get_effective_commit(repo_path)
+        if not current_ref:
+            scene.blendsync_staged_summary = "No commits yet."
+            return {'FINISHED'}
+
+        try:
+            snap_committed = git_interface.get_snapshot_at_commit(
+                repo_path, current_ref, json_path
+            )
+        except (git_interface.GitError, json.JSONDecodeError, ValueError):
+            scene.blendsync_staged_summary = "No committed snapshot to compare against."
+            return {'FINISHED'}
+
+        try:
+            snap_current = serializer.serialize_scene()
+        except Exception as e:
+            scene.blendsync_staged_summary = f"Serialization error: {e}"
+            return {'FINISHED'}
+
+        changes = differ.diff(snap_committed, snap_current)
+        n = len(changes)
+
+        if not changes:
+            scene.blendsync_staged_summary = "No changes since last commit."
+        else:
+            scene.blendsync_staged_summary = f"{n} change{'s' if n != 1 else ''} since last commit"
+            for change in changes:
+                icon, text = _format_change(change)
+                item = scene.blendsync_staged_changes.add()
+                item.text = text
+                item.icon_name = icon
+
         return {'FINISHED'}
 
 
@@ -391,12 +419,10 @@ class BLENDSYNC_OT_checkout_branch(bpy.types.Operator):
             self.report({'ERROR'}, f"Git error: {e}")
             return {'CANCELLED'}
 
-        context.scene.blendsync_diff_results.clear()
-        context.scene.blendsync_diff_summary = ""
-        bpy.ops.blendsync.refresh_branches()
-        bpy.ops.blendsync.refresh_log()
+        # Switching branch means we're on a real branch HEAD — clear revert marker
+        git_interface.clear_head_marker(repo_path)
 
-        _blend_path = blend_path  # capture for closure
+        _blend_path = blend_path
 
         def _reload():
             bpy.ops.wm.open_mainfile(filepath=_blend_path, load_ui=False)
@@ -417,6 +443,7 @@ classes = [
     BLENDSYNC_OT_commit,
     BLENDSYNC_OT_refresh_log,
     BLENDSYNC_OT_revert_commit,
+    BLENDSYNC_OT_refresh_staged,
     BLENDSYNC_OT_refresh_branches,
     BLENDSYNC_OT_create_branch,
     BLENDSYNC_OT_checkout_branch,

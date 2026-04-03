@@ -19,13 +19,14 @@ class BLENDSYNC_UL_history(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
         row = layout.row(align=True)
 
-        # Color dot: branch tip gets its branch color, other commits get a dim dot
-        dot_icon = item.color_tag if item.color_tag else 'DOT'
-        row.label(text="", icon=dot_icon)
+        # "You are here" arrow on the current HEAD commit
+        row.label(text="", icon='TRIA_RIGHT' if item.is_head else 'BLANK1')
+
+        # Branch color dot
+        row.label(text="", icon=item.color_tag if item.color_tag else 'DOT')
 
         row.label(text=f"{item.date}  {item.hash}")
 
-        # Show branch label badge when this commit is the tip of a branch
         if item.branch_label:
             sub = row.row()
             sub.scale_x = 0.7
@@ -33,18 +34,16 @@ class BLENDSYNC_UL_history(bpy.types.UIList):
 
         row.label(text=item.message)
 
-        op = row.operator("blendsync.revert_commit", text="", icon='LOOP_BACK')
-        op.commit_hash = item.hash
+        if not item.is_head:
+            op = row.operator("blendsync.revert_commit", text="", icon='LOOP_BACK')
+            op.commit_hash = item.hash
 
 
 class BLENDSYNC_UL_branches(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
         row = layout.row(align=True)
-        dot_icon = item.color_tag if item.color_tag else 'DOT'
-        row.label(text="", icon=dot_icon)
-
-        name_icon = 'LAYER_ACTIVE' if item.is_current else 'NONE'
-        row.label(text=item.name, icon=name_icon)
+        row.label(text="", icon=item.color_tag if item.color_tag else 'DOT')
+        row.label(text=item.name, icon='LAYER_ACTIVE' if item.is_current else 'NONE')
 
         if item.is_current:
             row.label(text="current")
@@ -76,26 +75,9 @@ class BLENDSYNC_PT_main(bpy.types.Panel):
             return
 
         repo_path = os.path.dirname(blend_path)
-        repo_exists = git_interface.is_repo(repo_path)
-
-        col = layout.column(align=True)
-        col.label(text=os.path.basename(blend_path), icon='FILE_BLEND')
-
-        if repo_exists:
-            scene = context.scene
-            branch = git_interface.get_current_branch(repo_path)
-            # Find the color for the current branch
-            color_icon = 'LAYER_ACTIVE'
-            for b in scene.blendsync_branches:
-                if b.name == branch:
-                    color_icon = b.color_tag or 'LAYER_ACTIVE'
-                    break
-            row = col.row(align=True)
-            row.label(text="", icon=color_icon)
-            row.label(text=branch or "(unknown branch)")
-        else:
-            col.label(text="No repository yet.", icon='INFO')
-            col.operator("blendsync.init_repo", icon='ADD')
+        if not git_interface.is_repo(repo_path):
+            layout.label(text="No repository yet.", icon='INFO')
+            layout.operator("blendsync.init_repo", icon='ADD')
 
 
 # ── Commit sub-panel ───────────────────────────────────────────────────────
@@ -114,9 +96,46 @@ class BLENDSYNC_PT_commit(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
+
         col = layout.column(align=True)
         col.prop(scene, "blendsync_commit_message", text="", placeholder="Describe this snapshot…")
         col.operator("blendsync.commit", icon='FILE_TICK')
+
+
+# ── Tracked changes sub-panel ─────────────────────────────────────────────
+
+class BLENDSYNC_PT_changes(bpy.types.Panel):
+    bl_label = "Tracked Changes"
+    bl_idname = "BLENDSYNC_PT_changes"
+    bl_parent_id = "BLENDSYNC_PT_main"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+
+    @classmethod
+    def poll(cls, context):
+        return _repo_ready(context)
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+
+        row = layout.row()
+        summary = getattr(scene, 'blendsync_staged_summary', '')
+        row.label(text=summary if summary else "Changes", icon='RADIOBUT_ON')
+        row.operator("blendsync.refresh_staged", text="", icon='FILE_REFRESH')
+
+        staged = getattr(scene, 'blendsync_staged_changes', [])
+        if staged:
+            for item in staged:
+                r = layout.row()
+                try:
+                    r.label(text=item.text, icon=item.icon_name)
+                except TypeError:
+                    r.label(text=item.text, icon='DOT')
+        elif summary:
+            layout.label(text="Nothing to commit.", icon='CHECKMARK')
+        else:
+            layout.label(text="Click ↺ to scan for changes.", icon='INFO')
 
 
 # ── Branches sub-panel ─────────────────────────────────────────────────────
@@ -190,35 +209,6 @@ class BLENDSYNC_PT_history(bpy.types.Panel):
             layout.label(text="No commits yet.")
 
 
-# ── Last commit diff sub-panel ─────────────────────────────────────────────
-
-class BLENDSYNC_PT_last_commit(bpy.types.Panel):
-    bl_label = "Last Commit Changes"
-    bl_idname = "BLENDSYNC_PT_last_commit"
-    bl_parent_id = "BLENDSYNC_PT_main"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_options = {'DEFAULT_CLOSED'}
-
-    @classmethod
-    def poll(cls, context):
-        return _repo_ready(context) and bool(context.scene.blendsync_diff_summary)
-
-    def draw(self, context):
-        layout = self.layout
-        scene = context.scene
-
-        layout.label(text=scene.blendsync_diff_summary, icon='ARROW_LEFTRIGHT')
-        layout.separator()
-
-        for item in scene.blendsync_diff_results:
-            row = layout.row()
-            try:
-                row.label(text=item.text, icon=item.icon_name)
-            except TypeError:
-                row.label(text=item.text, icon='DOT')
-
-
 # ── Registration list ──────────────────────────────────────────────────────
 
 classes = [
@@ -226,7 +216,7 @@ classes = [
     BLENDSYNC_UL_branches,
     BLENDSYNC_PT_main,
     BLENDSYNC_PT_commit,
+    BLENDSYNC_PT_changes,
     BLENDSYNC_PT_branches,
     BLENDSYNC_PT_history,
-    BLENDSYNC_PT_last_commit,
 ]

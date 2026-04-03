@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(zip -r blendsync.zip blendsync/ --exclude \"blendsync/__pycache__/*\" \"blendsync/*.pyc\")"
+    ]
+  }
+}

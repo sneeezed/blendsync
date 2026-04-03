@@ -14,6 +14,30 @@ def hash_mesh(obj):
     return h.hexdigest()[:16]
 
 
+def hash_node_tree(node_group):
+    """Stable hash of a node tree's structure and values — works for both
+    Geometry Node trees and Shader node trees."""
+    if not node_group:
+        return None
+    h = hashlib.sha256()
+    for node in sorted(node_group.nodes, key=lambda n: n.name):
+        h.update(node.name.encode('utf-8'))
+        h.update(node.type.encode('utf-8'))
+        for inp in node.inputs:
+            if not hasattr(inp, 'default_value'):
+                continue
+            try:
+                h.update(str(list(inp.default_value)).encode('utf-8'))
+            except TypeError:
+                h.update(str(inp.default_value).encode('utf-8'))
+    for link in node_group.links:
+        h.update(
+            f"{link.from_node.name}:{link.from_socket.name}"
+            f"->{link.to_node.name}:{link.to_socket.name}".encode('utf-8')
+        )
+    return h.hexdigest()[:16]
+
+
 def serialize_node_tree(tree):
     nodes = []
     for node in tree.nodes:
@@ -22,7 +46,6 @@ def serialize_node_tree(tree):
             if not hasattr(inp, 'default_value'):
                 continue
             val = inp.default_value
-            # Convert non-JSON-serializable types (e.g. Color, Vector) to lists
             try:
                 inputs[inp.name] = list(val)
             except TypeError:
@@ -49,14 +72,18 @@ def serialize_node_tree(tree):
 
 
 def serialize_object(obj):
-    modifiers = [
-        {
+    modifiers = []
+    for m in obj.modifiers:
+        entry = {
             "name": m.name,
             "type": m.type,
             "show_viewport": m.show_viewport,
         }
-        for m in obj.modifiers
-    ]
+        if m.type == 'NODES':
+            ng = getattr(m, 'node_group', None)
+            entry["geo_nodes_name"] = ng.name if ng else None
+            entry["geo_nodes_hash"] = hash_node_tree(ng)
+        modifiers.append(entry)
 
     mesh_summary = None
     if obj.type == 'MESH' and obj.data:
@@ -89,6 +116,7 @@ def serialize_material(mat):
         "use_nodes": mat.use_nodes,
         "roughness": mat.roughness,
         "metallic": mat.metallic,
+        "shader_hash": hash_node_tree(mat.node_tree) if mat.use_nodes and mat.node_tree else None,
         "node_tree": serialize_node_tree(mat.node_tree) if mat.use_nodes and mat.node_tree else None,
     }
 

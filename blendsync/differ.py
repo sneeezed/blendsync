@@ -45,7 +45,7 @@ def _diff_object(obj_a, obj_b, changes):
             "to": obj_b.get('visible'),
         })
 
-    # Geometry hash
+    # Geometry hash (mesh changes)
     hash_a = obj_a.get('geometry_hash')
     hash_b = obj_b.get('geometry_hash')
     if hash_a and hash_b and hash_a != hash_b:
@@ -64,21 +64,14 @@ def _diff_object(obj_a, obj_b, changes):
     mods_b = {m['name']: m for m in (obj_b.get('modifiers') or [])}
 
     for mod_name in set(mods_a) - set(mods_b):
-        changes.append({
-            "type": "modifier_removed",
-            "object": name,
-            "modifier": mod_name,
-        })
+        changes.append({"type": "modifier_removed", "object": name, "modifier": mod_name})
 
     for mod_name in set(mods_b) - set(mods_a):
-        changes.append({
-            "type": "modifier_added",
-            "object": name,
-            "modifier": mod_name,
-        })
+        changes.append({"type": "modifier_added", "object": name, "modifier": mod_name})
 
     for mod_name in set(mods_a) & set(mods_b):
         ma, mb = mods_a[mod_name], mods_b[mod_name]
+
         if ma.get('show_viewport') != mb.get('show_viewport'):
             changes.append({
                 "type": "modifier_changed",
@@ -88,6 +81,25 @@ def _diff_object(obj_a, obj_b, changes):
                 "from": ma.get('show_viewport'),
                 "to": mb.get('show_viewport'),
             })
+
+        # Geometry Nodes
+        if ma.get('type') == 'NODES':
+            na, nb = ma.get('geo_nodes_name'), mb.get('geo_nodes_name')
+            ha, hb = ma.get('geo_nodes_hash'), mb.get('geo_nodes_hash')
+            if na != nb:
+                changes.append({
+                    "type": "geo_nodes_reassigned",
+                    "object": name,
+                    "modifier": mod_name,
+                    "from": na,
+                    "to": nb,
+                })
+            elif ha and hb and ha != hb:
+                changes.append({
+                    "type": "geo_nodes_edited",
+                    "object": name,
+                    "modifier": mod_name,
+                })
 
 
 def _diff_materials(snapshot_a, snapshot_b, changes):
@@ -114,13 +126,33 @@ def _diff_materials(snapshot_a, snapshot_b, changes):
                     "to": vb,
                 })
 
-        # Node tree diff — detect changed input default values
+        # Shader node tree — only do detailed diff if the hash changed
+        sha, shb = ma.get('shader_hash'), mb.get('shader_hash')
+        if sha and shb and sha == shb:
+            continue  # Identical tree, skip
+
         tree_a = ma.get('node_tree')
         tree_b = mb.get('node_tree')
+
         if tree_a and tree_b:
             nodes_a = {n['name']: n for n in tree_a.get('nodes', [])}
             nodes_b = {n['name']: n for n in tree_b.get('nodes', [])}
 
+            for node_name in set(nodes_b) - set(nodes_a):
+                changes.append({
+                    "type": "shader_node_added",
+                    "material": name,
+                    "node": node_name,
+                })
+
+            for node_name in set(nodes_a) - set(nodes_b):
+                changes.append({
+                    "type": "shader_node_removed",
+                    "material": name,
+                    "node": node_name,
+                })
+
+            # Changed input values on existing nodes
             for node_name in set(nodes_a) & set(nodes_b):
                 inputs_a = nodes_a[node_name].get('inputs', {})
                 inputs_b = nodes_b[node_name].get('inputs', {})
@@ -135,6 +167,25 @@ def _diff_materials(snapshot_a, snapshot_b, changes):
                             "from": va,
                             "to": vb,
                         })
+
+            # Changed links
+            def _link_set(tree):
+                return {
+                    f"{l['from_node']}:{l['from_socket']}->{l['to_node']}:{l['to_socket']}"
+                    for l in tree.get('links', [])
+                }
+
+            links_a, links_b = _link_set(tree_a), _link_set(tree_b)
+            if links_a != links_b:
+                changes.append({
+                    "type": "shader_links_changed",
+                    "material": name,
+                })
+
+        elif tree_b and not tree_a:
+            changes.append({"type": "shader_nodes_enabled", "material": name})
+        elif tree_a and not tree_b:
+            changes.append({"type": "shader_nodes_disabled", "material": name})
 
 
 def _diff_render(snapshot_a, snapshot_b, changes):

@@ -161,6 +161,45 @@ def get_current_branch(repo_path):
         return None
 
 
+def get_head_hash(repo_path):
+    """Return the short hash of the current HEAD commit."""
+    try:
+        return run_git(['rev-parse', '--short', 'HEAD'], cwd=repo_path)
+    except GitError:
+        return None
+
+
+def get_effective_commit(repo_path):
+    """Return the hash that the working tree is currently at.
+    If the user reverted to an older commit, reads .blendsync_head.
+    Otherwise returns git HEAD."""
+    import os
+    marker = os.path.join(repo_path, '.blendsync_head')
+    if os.path.exists(marker):
+        try:
+            with open(marker) as f:
+                h = f.read().strip()
+            if h:
+                return h
+        except OSError:
+            pass
+    return get_head_hash(repo_path)
+
+
+def write_head_marker(repo_path, commit_hash):
+    import os
+    marker = os.path.join(repo_path, '.blendsync_head')
+    with open(marker, 'w') as f:
+        f.write(commit_hash)
+
+
+def clear_head_marker(repo_path):
+    import os
+    marker = os.path.join(repo_path, '.blendsync_head')
+    if os.path.exists(marker):
+        os.remove(marker)
+
+
 def create_branch(repo_path, name):
     run_git(['checkout', '-b', name], cwd=repo_path)
 
