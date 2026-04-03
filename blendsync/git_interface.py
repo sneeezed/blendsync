@@ -7,16 +7,39 @@ class GitError(Exception):
     pass
 
 
+# Cached once at module load — git availability doesn't change during a session.
+# If the user installs git while Blender is open they must restart Blender.
+_git_available = None
+
+
 def is_available():
-    try:
-        subprocess.run(['git', '--version'], capture_output=True, check=True)
-        return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return False
+    global _git_available
+    if _git_available is None:
+        try:
+            subprocess.run(['git', '--version'], capture_output=True, check=True)
+            _git_available = True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            _git_available = False
+    return _git_available
+
+
+# Cached per-path — .git presence doesn't change unless the user runs init_repo()
+# or manually deletes the .git folder while Blender is open (unsupported).
+_repo_cache: dict = {}
 
 
 def is_repo(path):
-    return os.path.isdir(os.path.join(path, '.git'))
+    if path not in _repo_cache:
+        _repo_cache[path] = os.path.isdir(os.path.join(path, '.git'))
+    return _repo_cache[path]
+
+
+def _invalidate_repo_cache(path=None):
+    """Call after creating or destroying a repo so is_repo() picks up the change."""
+    if path is None:
+        _repo_cache.clear()
+    else:
+        _repo_cache.pop(path, None)
 
 
 def run_git(args, cwd):
@@ -59,6 +82,9 @@ def init_repo(path):
         run_git(['commit', '-m', 'Initialize BlendSync repository'], cwd=path)
     except GitError:
         pass  # Nothing to commit is fine
+
+    # Bust the cache so is_repo() immediately returns True for this path
+    _invalidate_repo_cache(path)
 
 
 def commit(repo_path, message):

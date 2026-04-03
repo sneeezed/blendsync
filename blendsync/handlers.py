@@ -10,6 +10,10 @@ def on_save_post(scene, *args):
     if not blend_path:
         return
 
+    addon = bpy.context.preferences.addons.get('blendsync')
+    if addon and not addon.preferences.auto_snapshot:
+        return
+
     try:
         data = serializer.serialize_scene()
         json_path = blend_path.replace('.blend', '.blendsync.json')

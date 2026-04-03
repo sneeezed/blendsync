@@ -10,7 +10,7 @@ bl_info = {
 
 import bpy
 
-from . import handlers, operators, panels
+from . import handlers, operators, panels, preferences
 
 
 def register():
@@ -18,6 +18,9 @@ def register():
         unregister()
     except Exception:
         pass
+
+    for cls in preferences.classes:
+        bpy.utils.register_class(cls)
 
     for cls in operators.classes:
         bpy.utils.register_class(cls)
@@ -79,4 +82,7 @@ def unregister():
             delattr(bpy.types.Scene, prop)
 
     for cls in reversed(operators.classes):
+        bpy.utils.unregister_class(cls)
+
+    for cls in reversed(preferences.classes):
         bpy.utils.unregister_class(cls)

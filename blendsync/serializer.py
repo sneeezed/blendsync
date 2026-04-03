@@ -1,5 +1,5 @@
+import array
 import hashlib
-import struct
 
 import bpy
 
@@ -8,10 +8,13 @@ def hash_mesh(obj):
     if obj.type != 'MESH':
         return None
     mesh = obj.data
-    h = hashlib.sha256()
-    for v in mesh.vertices:
-        h.update(struct.pack('fff', *v.co))
-    return h.hexdigest()[:16]
+    count = len(mesh.vertices)
+    if count == 0:
+        return hashlib.sha256(b'').hexdigest()[:16]
+    # foreach_get pulls all coordinates in one C-level call — no Python loop.
+    coords = array.array('f', [0.0]) * (count * 3)
+    mesh.vertices.foreach_get('co', coords)
+    return hashlib.sha256(coords.tobytes()).hexdigest()[:16]
 
 
 def hash_node_tree(node_group):
